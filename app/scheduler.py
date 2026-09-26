@@ -23,6 +23,18 @@ STATUS_OK = "ok"
 STATUS_POSITIVE_CYCLE = "positive_cycle"
 STATUS_DEADLINE_EXCEEDED = "deadline_exceeded"
 
+# 证据起点类型：某点的原始释放时间 / 本次 delay 覆盖值
+KIND_RELEASE = "release"
+KIND_DELAY = "delay"
+
+
+class InconsistentScheduleError(Exception):
+    """证据链与给定最早时刻对不上：实现缺陷或落库数据被篡改。
+
+    API 层把它翻译成稳定的 ``result_inconsistent`` 错误；既有记录保持
+    原样，绝不改写。
+    """
+
 
 def earliest_schedule(points, relations, delay=None):
     """求逐点最早可执行时刻。
@@ -44,7 +56,8 @@ def earliest_schedule(points, relations, delay=None):
         无正权环但有点最早时刻超过 latest::
 
             {"status": "deadline_exceeded",
-             "violations": [{"id": str, "earliest": int, "latest": int}, ...]}
+             "violations": [{"id": str, "earliest": int, "latest": int}, ...],
+             "times": {id: int, ...}}  # 收敛时刻，供违约点追溯证据链
     """
     delay = delay or {}
     ids = [p["id"] for p in points]
@@ -86,6 +99,108 @@ def earliest_schedule(points, relations, delay=None):
                 {"id": pid, "earliest": times[pid], "latest": latest}
             )
     if violations:
-        return {"status": STATUS_DEADLINE_EXCEEDED, "violations": violations}
+        return {"status": STATUS_DEADLINE_EXCEEDED, "violations": violations,
+                "times": times}
 
     return {"status": STATUS_OK, "times": times}
+
+
+# ---- 因果解释：沿实际取紧的关系追溯证据链 ------------------------------------
+
+
+def evidence_chains(points, relations, delay, times, targets):
+    """在已收敛的 ``times`` 上为 ``targets`` 追溯因果证据链。
+
+    每条证据从某点的基础下界（原始 release，或本次 delay 覆盖值）出发，沿
+    **实际取紧**的关系（``times[to] == times[from] + min_gap``）到达目标点；
+    逐边时差（取紧边上恰等于 min_gap）相加必然恰好等于 ``times[target]``。
+
+    等价链（同样取紧、同样抵达目标点）按如下规则选出唯一结果：
+
+    1. 关系数（经过的边数）最少者优先；
+    2. 再按完整点 ID 序列的 UTF-8 字节序取最小者。
+
+    零间隔环不会使追溯循环：绕环一周只增加关系数而不改变任何时刻，去掉环的
+    链必然更优，因此最优链不含重复点，松弛必在有限轮内收敛。
+
+    :param points: 已校验的提示点列表（同 :func:`earliest_schedule`）。
+    :param relations: 已校验的关系列表。
+    :param delay: 本次延误覆盖（可为 None）。
+    :param times: 无正权环的收敛时刻表（:func:`earliest_schedule` 的输出；
+        含 ``deadline_exceeded`` 结局中的时刻）。
+    :param targets: 需要证据的点 ID 列表。
+    :returns: ``{target: evidence}``，key 顺序与 ``targets`` 一致。
+    :raises InconsistentScheduleError: 追溯结果与 ``times`` 对不上。
+    """
+    delay = delay or {}
+    base = {}
+    kinds = {}
+    for p in points:
+        pid = p["id"]
+        if pid in delay:
+            base[pid] = int(delay[pid])
+            kinds[pid] = KIND_DELAY
+        else:
+            base[pid] = p["release"]
+            kinds[pid] = KIND_RELEASE
+
+    id_bytes = {pid: pid.encode("utf-8") for pid in base}
+
+    # 取紧边：times[u] + min_gap == times[v]。
+    tight_edges = [
+        (r["from"], r["to"])
+        for r in relations
+        if times[r["from"]] + r["min_gap"] == times[r["to"]]
+    ]
+
+    # best[pid] = (关系数, 完整点 ID 字节序列, 点 ID 路径)；None = 尚未到达。
+    # 起点：时刻恰好等于基础下界的点（证据从这里出发，0 条关系）。
+    best = {}
+    for pid in base:
+        if times[pid] == base[pid]:
+            best[pid] = (0, (id_bytes[pid],), (pid,))
+        else:
+            best[pid] = None
+
+    # Bellman-Ford 式松弛：候选严格更优才替换。最优链必为简单链（至多
+    # n-1 条边——含重复点的链可去掉零权环得到更优者），n 轮内必收敛；
+    # 绕零间隔环的候选关系数更多，必然败北，追溯不会沿环打转。
+    for _ in range(len(base)):
+        changed = False
+        for u, v in tight_edges:
+            chain_u = best[u]
+            if chain_u is None:
+                continue
+            key = (chain_u[0] + 1, chain_u[1] + (id_bytes[v],))
+            current = best[v]
+            if current is None or key < current[:2]:
+                best[v] = (key[0], key[1], chain_u[2] + (v,))
+                changed = True
+        if not changed:
+            break
+
+    explanations = {}
+    for target in targets:
+        chain = best.get(target)
+        if chain is None:
+            raise InconsistentScheduleError(
+                f"no tight evidence chain reaches point {target!r}")
+        path = chain[2]
+        steps = []
+        total = base[path[0]]
+        for u, v in zip(path, path[1:]):
+            gap = times[v] - times[u]  # 取紧边的时差 == 该关系的 min_gap
+            steps.append({"from": u, "to": v, "min_gap": gap})
+            total += gap
+        if total != times[target]:
+            raise InconsistentScheduleError(
+                f"evidence for {target!r} sums to {total}, "
+                f"but earliest time is {times[target]}")
+        explanations[target] = {
+            "target": target,
+            "start": {"id": path[0], "kind": kinds[path[0]],
+                      "value": base[path[0]]},
+            "steps": steps,
+            "earliest": times[target],
+        }
+    return explanations

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from .errors import AppError, INVALID_TEMPLATE, INVALID_DELAY
+from .errors import AppError, INVALID_TEMPLATE, INVALID_DELAY, INVALID_EXPLAIN
 
 MAX_POINTS = 300
 MAX_RELATIONS = 3000
@@ -190,7 +190,7 @@ def validate_delay(payload, canonical_template):
         raise AppError(INVALID_DELAY, "Delay override must be a JSON object.",
                        status_code=400)
 
-    allowed_top = {"template_id", "delay"}
+    allowed_top = {"template_id", "delay", "explain"}
     extra = set(payload) - allowed_top
     if extra:
         raise AppError(
@@ -230,3 +230,43 @@ def validate_delay(payload, canonical_template):
         delay[key] = value
 
     return delay
+
+
+def validate_explain(payload, canonical_template):
+    """校验推演请求体中可选的 ``explain`` 字段。
+
+    ``explain`` 是点 ID 数组：请求为哪些提示点生成因果解释。返回按点 ID
+    升序、去重后的目标列表；未提供时返回空列表（等同未请求解释）。
+    """
+    raw = payload.get("explain")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise AppError(INVALID_EXPLAIN,
+                       "Field 'explain' must be an array of point ids.",
+                       status_code=400)
+    return _normalize_explain_ids(raw, canonical_template)
+
+
+def normalize_explain_query(raw_ids, canonical_template):
+    """校验 ``GET /results/{id}?explain=...`` 的（可重复）查询参数。"""
+    return _normalize_explain_ids(list(raw_ids), canonical_template)
+
+
+def _normalize_explain_ids(raw_ids, canonical_template):
+    """把点 ID 列表规范化为升序去重列表；非法项报 ``invalid_explain``。"""
+    known = {p["id"] for p in canonical_template["points"]}
+    targets = set()
+    for index, item in enumerate(raw_ids):
+        where = f"explain[{index}]"
+        if not _is_non_empty_str(item):
+            raise AppError(INVALID_EXPLAIN,
+                           f"{where} must be a non-empty point id string.",
+                           status_code=400, details={"path": where})
+        if item not in known:
+            raise AppError(
+                INVALID_EXPLAIN,
+                f"{where} references unknown point id {item!r}.",
+                status_code=400, details={"path": where, "id": item})
+        targets.add(item)
+    return sorted(targets)

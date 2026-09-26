@@ -18,6 +18,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .scheduler import InconsistentScheduleError
+
 logger = logging.getLogger("broadcast_cue_api")
 
 
@@ -45,10 +47,12 @@ class AppError(Exception):
 
 INVALID_TEMPLATE = "invalid_template"        # 模板不满足登记规则，HTTP 400
 INVALID_DELAY = "invalid_delay"              # delay 覆盖不合法，HTTP 400
+INVALID_EXPLAIN = "invalid_explain"          # explain 目标点不合法，HTTP 400
 TEMPLATE_NOT_FOUND = "template_not_found"    # 模板 ID 不存在，HTTP 404
 RESULT_NOT_FOUND = "result_not_found"        # 结果 ID 不存在，HTTP 404
 POSITIVE_CYCLE = "positive_cycle"            # 存在正权环，HTTP 422
 DEADLINE_EXCEEDED = "deadline_exceeded"      # 最早时刻超过 latest，HTTP 422
+RESULT_INCONSISTENT = "result_inconsistent"  # 重算核对不一致，HTTP 500
 BAD_JSON = "bad_json"                        # 请求体不是合法 JSON，HTTP 400
 NOT_FOUND = "not_found"                      # 路径不存在，HTTP 404
 METHOD_NOT_ALLOWED = "method_not_allowed"    # HTTP 方法不允许，HTTP 405
@@ -59,6 +63,19 @@ def register_exception_handlers(app) -> None:
     @app.exception_handler(AppError)
     async def _app_error(_: Request, exc: AppError):
         return exc.to_response()
+
+    @app.exception_handler(InconsistentScheduleError)
+    async def _inconsistent_schedule(_: Request,
+                                     exc: InconsistentScheduleError):
+        # 用冻结模板 + delay 重算后与既有结果对不上：明确报错，记录保持
+        # 原样（读取路径从不改写任何记录）。
+        logger.error("Schedule inconsistency detected: %s", exc)
+        return AppError(
+            RESULT_INCONSISTENT,
+            "The stored result does not match a recomputation from its "
+            "frozen template and delay; the record was left unchanged.",
+            status_code=500,
+        ).to_response()
 
     @app.exception_handler(RequestValidationError)
     async def _request_validation_error(_: Request,

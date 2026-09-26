@@ -31,12 +31,12 @@ SQLite。推演对规则的输入顺序不敏感——同一批规则无论怎�
 
 ```
 app/
-  main.py        # FastAPI 入口：/templates、/derivations、/results/{id}
-  scheduler.py   # 最早时刻推演（最长路 / Bellman-Ford 式松弛，不枚举候选时间）
-  validation.py  # 模板与 delay 覆盖的严格校验 + 规范化
+  main.py        # FastAPI 入口：/templates、/derivations、/results/{id}（含可选因果解释）
+  scheduler.py   # 最早时刻推演（最长路 / Bellman-Ford 式松弛，不枚举候选时间）+ 取紧证据链追溯
+  validation.py  # 模板、delay 覆盖与 explain 目标的严格校验 + 规范化
   db.py          # SQLite 持久层（只写入合法模板与成功结果；WAL 单次初始化、BEGIN IMMEDIATE 有界等待）
   errors.py      # 稳定错误码与统一错误响应（含 503 service_unavailable）
-tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 接口与持久化 + 真实 SQLite 并发验收
+tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 因果解释（等价链/零环/截止违约/重启读取）+ 接口与持久化 + 真实 SQLite 并发验收
 Dockerfile
 docker-compose.yml
 ```
@@ -101,8 +101,8 @@ python3 -m pytest -q
 |---|---|---|
 | `GET /health` | 健康检查 | 200 |
 | `POST /templates` | 校验并登记合法模板（返回模板 ID 与规范化内容） | 201 |
-| `POST /derivations` | 对已登记模板执行延误推演，成功才落库 | 201 |
-| `GET /results/{result_id}` | 按结果 ID 取回成功结果（重启后仍可查） | 200 |
+| `POST /derivations` | 对已登记模板执行延误推演，成功才落库；可选 `explain` 请求因果解释 | 201 |
+| `GET /results/{result_id}` | 按结果 ID 取回成功结果（重启后仍可查）；可选 `?explain=` 读取同一解释 | 200 |
 
 ### 稳定错误代码
 
@@ -111,10 +111,12 @@ python3 -m pytest -q
 | `invalid_template` | 400 | 模板违反任一登记规则；**非法模板不落库** |
 | `bad_json` | 400 | 请求体不是合法 JSON 或不是 JSON 对象 |
 | `invalid_delay` | 400 | delay 引用不存在的点、为负、或小于原 release |
+| `invalid_explain` | 400 | explain 不是点 ID 数组、含空串、或引用了不存在的点 |
 | `template_not_found` | 404 | 推演引用了不存在的模板 ID |
 | `result_not_found` | 404 | 查询的结果 ID 不存在（含失败推演——它们从不生成记录） |
 | `positive_cycle` | 422 | 规则存在总 min_gap 为正的有向环，不存在有限最早时刻 |
 | `deadline_exceeded` | 422 | 无正权环，但至少一点最早时刻 > latest |
+| `result_inconsistent` | 500 | 读取解释时用冻结模板 + delay 重算，与落库结果不一致；记录不被改写 |
 | `service_unavailable` | 503 | 并发写争用在有界等待（默认 5s）后仍未获得写锁；可重试，带 `Retry-After: 1`，不暴露 SQLite 内部错误 |
 | `not_found` / `method_not_allowed` | 404 / 405 | 未知路径 / 方法不允许 |
 
@@ -227,6 +229,65 @@ HTTP 400
              "details": {"path": "relations[0].to", "id": "ghost"} } }
 ```
 
+## 因果解释（可选）
+
+彩排出某个提示点晚于预期时，导播需要看见**究竟是哪条释放时间与先后约束链
+把它推迟**，而不只是一个时刻数字。解释为可选项，两处入口产出**同一份**结果：
+
+- `POST /derivations` 请求体加 `"explain": ["<点ID>", ...]`：成功响应增加
+  `explanations`；截止违约（`deadline_exceeded`）时 `details.explanations`
+  给出 **ID 最小的违约点**的证据（失败推演仍不落库）；正权环依旧优先报
+  `positive_cycle`，不附证据。
+- `GET /results/{result_id}?explain=<点ID>`（参数可重复）：对已保存结果按
+  ID 读取同一解释。解释**不入库**——每次用冻结模板 + 落库 delay 重算并与
+  落库时刻核对，不一致时返回 500 `result_inconsistent`，记录不被改写。
+
+未请求解释时，所有响应与旧契约**逐项一致**（不多一个键）。
+
+### 证据格式
+
+```bash
+curl -s http://127.0.0.1:8000/derivations \
+  -H 'Content-Type: application/json' \
+  -d "{\"template_id\":\"$TID\",\"delay\":{\"a\":30},\"explain\":[\"d\"]}"
+```
+
+```json
+{
+  "...": "其余字段同前",
+  "explanations": {
+    "d": {
+      "target": "d",
+      "start": {"id": "a", "kind": "delay", "value": 30},
+      "steps": [
+        {"from": "a", "to": "c", "min_gap": 20},
+        {"from": "c", "to": "d", "min_gap": 0}
+      ],
+      "earliest": 50
+    }
+  }
+}
+```
+
+每条证据满足：
+
+- **起点**是某点的原始释放时间（`"kind": "release"`）或本次 delay 覆盖
+  （`"kind": "delay"`），`value` 即该基础下界；
+- `steps` 只走**实际取紧**的关系（`t[to] == t[from] + min_gap`），
+  逐边时差（取紧边上恰为 `min_gap`）相加**恰好等于**返回的最早时刻：
+  `start.value + Σ steps[*].min_gap == earliest == times[target]`；
+- 目标点时刻就等于自身基础下界时，`steps` 为空。
+
+### 等价链裁决（结果唯一）
+
+多条链同样取紧、同样抵达目标点时：
+
+1. **关系数最少**者优先；
+2. 再按**完整点 ID 序列的 UTF-8 字节序**取最小者。
+
+**零间隔环不会使追溯循环**：绕环一周只增加关系数而不改变任何时刻，去掉环
+的链必然更优，因此证据链不含重复点、追溯必在有限步内停止。
+
 ## 算法说明（为什么结果唯一且不需要枚举候选时间）
 
 每条约束都是一个**下界**：
@@ -246,3 +307,9 @@ HTTP 400
   （时刻可沿环无限增长）⇒ `positive_cycle`；
 - 否则对每个点核对 `latest`，超限即 `deadline_exceeded`；
 - 总权为 0 的环（含 0 权自环）合法：它只会把环上各点拉平到同一最早时刻。
+
+证据链追溯复用同一不动点：在收敛时刻表上只保留**取紧边**
+（`t[v] == t[u] + min_gap`），从"时刻恰等于自身基础下界"的点出发做同样的
+Bellman-Ford 式松弛，只不过传播的不再是时刻而是
+`(关系数, 完整点 ID 字节序列)` 字典序下的最优链——候选严格更优才替换，
+因此与边扫描顺序无关、零权环上不会打转，且每个点得到的链唯一。
