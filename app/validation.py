@@ -190,7 +190,7 @@ def validate_delay(payload, canonical_template):
         raise AppError(INVALID_DELAY, "Delay override must be a JSON object.",
                        status_code=400)
 
-    allowed_top = {"template_id", "delay"}
+    allowed_top = {"template_id", "delay", "explain"}
     extra = set(payload) - allowed_top
     if extra:
         raise AppError(
@@ -199,6 +199,13 @@ def validate_delay(payload, canonical_template):
             status_code=400,
             details={"unexpected_fields": sorted(extra)},
         )
+
+    explain = payload.get("explain", False)
+    if not isinstance(explain, bool):
+        raise AppError(
+            INVALID_DELAY,
+            "Field 'explain' must be a boolean when present.",
+            status_code=400, details={"path": "explain"})
 
     raw_delay = payload.get("delay", {})
     if not isinstance(raw_delay, dict):

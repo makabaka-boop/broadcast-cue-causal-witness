@@ -53,6 +53,8 @@ BAD_JSON = "bad_json"                        # 请求体不是合法 JSON，HTTP
 NOT_FOUND = "not_found"                      # 路径不存在，HTTP 404
 METHOD_NOT_ALLOWED = "method_not_allowed"    # HTTP 方法不允许，HTTP 405
 SERVICE_UNAVAILABLE = "service_unavailable"  # 短暂写争用等待超时，HTTP 503
+INVALID_REQUEST = "invalid_request"          # 请求参数不合法（如 explain 取值），HTTP 400
+RESULT_INCONSISTENT = "result_inconsistent"  # 保存结果与冻结模板+delay 重算不一致，HTTP 500
 
 
 def register_exception_handlers(app) -> None:

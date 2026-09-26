@@ -6,11 +6,12 @@ from fastapi import FastAPI, Request
 from starlette.concurrency import run_in_threadpool
 
 from . import db
-from .errors import (AppError, DEADLINE_EXCEEDED, POSITIVE_CYCLE,
-                     RESULT_NOT_FOUND, TEMPLATE_NOT_FOUND,
-                     register_exception_handlers)
+from .errors import (AppError, DEADLINE_EXCEEDED, INVALID_REQUEST,
+                     POSITIVE_CYCLE, RESULT_INCONSISTENT, RESULT_NOT_FOUND,
+                     TEMPLATE_NOT_FOUND, register_exception_handlers)
 from .scheduler import (STATUS_DEADLINE_EXCEEDED, STATUS_OK,
-                        STATUS_POSITIVE_CYCLE, earliest_schedule)
+                        STATUS_POSITIVE_CYCLE, earliest_schedule,
+                        explain_schedule, verify_result_explanations)
 from .validation import validate_delay, validate_template
 
 
@@ -69,11 +70,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 status_code=404, details={"template_id": template_id})
 
         delay = validate_delay(payload, template)
-        outcome = earliest_schedule(template["points"],
-                                    template["relations"], delay)
+        # explain 已在 validate_delay 中校验为布尔（缺省 False）。
+        want_explain = payload.get("explain", False)
+
+        if want_explain:
+            outcome = explain_schedule(template["points"],
+                                       template["relations"], delay)
+        else:
+            outcome = earliest_schedule(template["points"],
+                                        template["relations"], delay)
 
         if outcome["status"] == STATUS_POSITIVE_CYCLE:
-            # 不落库、不触碰既有数据，只给明确的不可实现结论。
+            # 正权环永远优先报原错误：不落库、不附解释、不触碰既有数据。
             raise AppError(
                 POSITIVE_CYCLE,
                 "The rules contain a directed cycle with positive total "
@@ -81,17 +89,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 status_code=422)
 
         if outcome["status"] == STATUS_DEADLINE_EXCEEDED:
+            details = {"violations": outcome["violations"]}
+            if want_explain:
+                # ID 最小的违约点及其证据链；失败推演同样不落库。
+                details["explanation"] = outcome["explanation"]
             raise AppError(
                 DEADLINE_EXCEEDED,
                 "At least one point's earliest time exceeds its latest bound.",
                 status_code=422,
-                details={"violations": outcome["violations"]})
+                details=details)
 
         assert outcome["status"] == STATUS_OK
         times = outcome["times"]
         result_id, created_at = await run_in_threadpool(
             db.insert_result, template_id, delay, times, _db_path(request))
-        return {
+        body = {
             "result_id": result_id,
             "template_id": template_id,
             "created_at": created_at,
@@ -99,9 +111,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "times": _sorted_times(template["points"], times),
             "points": _schedule_points(template["points"], times),
         }
+        if want_explain:
+            # 解释只随响应给出，不落库；读取时按冻结模板 + delay 重算。
+            body["explanations"] = outcome["explanations"]
+        return body
 
     @app.get("/results/{result_id}")
     async def get_result(result_id: str, request: Request):
+        want_explain = _parse_explain_query(request)
         record = await run_in_threadpool(
             db.get_result, result_id, _db_path(request))
         if record is None:
@@ -114,7 +131,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             db.get_template, record["template_id"], _db_path(request))
         # results.template_id 有外键约束，模板必然存在。
         points = template["points"]
-        return {
+        body = {
             "result_id": record["id"],
             "template_id": record["template_id"],
             "created_at": record["created_at"],
@@ -122,8 +139,37 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "times": _sorted_times(points, record["times"]),
             "points": _schedule_points(points, record["times"]),
         }
+        if want_explain:
+            # 解释不落库：由冻结模板 + delay 重算，并与保存的结果逐点核对；
+            # 不一致时明确报错，记录保持原样、绝不改写。
+            check = verify_result_explanations(
+                points, template["relations"], record["delay"],
+                record["times"])
+            if check["status"] != STATUS_OK:
+                raise AppError(
+                    RESULT_INCONSISTENT,
+                    "The stored result is inconsistent with its template "
+                    "and delay; the record was left unchanged.",
+                    status_code=500, details={"result_id": result_id})
+            body["explanations"] = check["explanations"]
+        return body
 
     return app
+
+
+def _parse_explain_query(request: Request) -> bool:
+    """解析 ``?explain=`` 查询参数：仅接受 true/false，其余明确报错。"""
+    raw = request.query_params.get("explain")
+    if raw is None:
+        return False
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise AppError(
+        INVALID_REQUEST,
+        "Query parameter 'explain' must be 'true' or 'false'.",
+        status_code=400, details={"param": "explain", "value": raw})
 
 
 async def _load_json_object(request: Request) -> dict:

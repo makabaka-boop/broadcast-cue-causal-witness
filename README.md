@@ -4,6 +4,8 @@
 推演同时满足全部下界的**逐点最早可执行时刻**，并把成功结果持久化到挂载卷中的
 SQLite。推演对规则的输入顺序不敏感——同一批规则无论怎样排列，只会得到
 **同一份**最早提示表；不可实现时给出明确的稳定错误代码，绝不伪装成排期。
+可选地，推演还能给出**因果解释**：某个提示点为什么是这个时刻——从哪条
+释放时间 / delay 与先后约束链被推迟至此，证据链唯一且可核对。
 
 - 框架：FastAPI（Python 3.11）
 - 存储：SQLite（WAL），默认数据库文件 `/data/app.db`（位于 Docker 挂载卷）
@@ -32,11 +34,11 @@ SQLite。推演对规则的输入顺序不敏感——同一批规则无论怎�
 ```
 app/
   main.py        # FastAPI 入口：/templates、/derivations、/results/{id}
-  scheduler.py   # 最早时刻推演（最长路 / Bellman-Ford 式松弛，不枚举候选时间）
+  scheduler.py   # 最早时刻推演（最长路 / Bellman-Ford 式松弛，不枚举候选时间）+ 因果解释（取紧边回溯，(关系数, 路径字节序) 唯一裁决）
   validation.py  # 模板与 delay 覆盖的严格校验 + 规范化
   db.py          # SQLite 持久层（只写入合法模板与成功结果；WAL 单次初始化、BEGIN IMMEDIATE 有界等待）
   errors.py      # 稳定错误码与统一错误响应（含 503 service_unavailable）
-tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 接口与持久化 + 真实 SQLite 并发验收
+tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 因果解释（等价链/零环/截止违约/重算核对/重启读取）+ 接口与持久化 + 真实 SQLite 并发验收
 Dockerfile
 docker-compose.yml
 ```
@@ -101,8 +103,8 @@ python3 -m pytest -q
 |---|---|---|
 | `GET /health` | 健康检查 | 200 |
 | `POST /templates` | 校验并登记合法模板（返回模板 ID 与规范化内容） | 201 |
-| `POST /derivations` | 对已登记模板执行延误推演，成功才落库 | 201 |
-| `GET /results/{result_id}` | 按结果 ID 取回成功结果（重启后仍可查） | 200 |
+| `POST /derivations` | 对已登记模板执行延误推演，成功才落库；`"explain": true` 时附因果解释 | 201 |
+| `GET /results/{result_id}` | 按结果 ID 取回成功结果（重启后仍可查）；`?explain=true` 时附同一份解释 | 200 |
 
 ### 稳定错误代码
 
@@ -110,11 +112,13 @@ python3 -m pytest -q
 |---|---|---|
 | `invalid_template` | 400 | 模板违反任一登记规则；**非法模板不落库** |
 | `bad_json` | 400 | 请求体不是合法 JSON 或不是 JSON 对象 |
-| `invalid_delay` | 400 | delay 引用不存在的点、为负、或小于原 release |
+| `invalid_delay` | 400 | delay 引用不存在的点、为负、或小于原 release；`explain` 字段不是布尔 |
+| `invalid_request` | 400 | 查询参数不合法（如 `?explain=` 取值不是 `true`/`false`） |
 | `template_not_found` | 404 | 推演引用了不存在的模板 ID |
 | `result_not_found` | 404 | 查询的结果 ID 不存在（含失败推演——它们从不生成记录） |
 | `positive_cycle` | 422 | 规则存在总 min_gap 为正的有向环，不存在有限最早时刻 |
 | `deadline_exceeded` | 422 | 无正权环，但至少一点最早时刻 > latest |
+| `result_inconsistent` | 500 | 已保存结果与冻结模板 + delay 重算不一致；记录保持原样、绝不改写 |
 | `service_unavailable` | 503 | 并发写争用在有界等待（默认 5s）后仍未获得写锁；可重试，带 `Retry-After: 1`，不暴露 SQLite 内部错误 |
 | `not_found` / `method_not_allowed` | 404 / 405 | 未知路径 / 方法不允许 |
 
@@ -123,6 +127,44 @@ python3 -m pytest -q
 也不改动任何既有数据。
 
 成功结果中的 `times` 与 `points` 一律按提示点 ID **升序**排列。
+
+## 因果解释（可选）：某点为什么是这个时刻
+
+彩排推演出某个提示点晚于预期时，导播需要看见究竟是哪条释放时间与先后
+约束链把它推迟，而不是只得到一个时刻数字。推演请求带 `"explain": true`
+时，成功响应额外包含 `explanations`（按点 ID 升序，覆盖全部提示点）；
+对已保存结果用 `GET /results/{result_id}?explain=true` 可取回**同一份**
+解释。每个点对应一条证据：
+
+```json
+{
+  "target": "d",
+  "time": 50,
+  "start": {"id": "a", "kind": "delay", "value": 30},
+  "edges": [{"from": "a", "to": "c", "min_gap": 20},
+            {"from": "c", "to": "d", "min_gap": 0}],
+  "path": ["a", "c", "d"]
+}
+```
+
+契约要点：
+
+- 每条证据从某点的**原始 release**（`"kind": "release"`）或**本次
+  delay**（`"kind": "delay"`）出发，沿**实际取紧**的关系
+  （`times[to] == times[from] + min_gap`）到达目标点；
+- 不变式：`start.value + Σ edges[].min_gap == time == times[target]`——
+  逐边时差相加恰好等于返回的最早时刻；
+- 等价链裁决：**关系数最少**者优先，再按**完整点 ID 序列的 UTF-8
+  字节序**（逐元素比较）取唯一结果——解释确定，与规则录入顺序无关；
+- 零间隔环不会使追溯循环：含环的链关系数更多，天然落选，证据路径中
+  点不重复；
+- 解释**不落库**：读取时由冻结模板 + delay 重算，并与保存的结果逐点
+  核对；发现不一致时返回 500 `result_inconsistent`，记录保持原样、
+  绝不改写；
+- `deadline_exceeded` 且请求解释时，`details.explanation` 给出
+  **ID 最小的违约点**及其证据（失败推演仍不落库）；`positive_cycle`
+  永远优先报原错误，不附解释；
+- 未请求解释时，所有响应与旧版逐项一致（无 `explanations` 字段）。
 
 ## 调用示例
 
